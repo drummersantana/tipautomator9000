@@ -1,0 +1,351 @@
+/************************************************************
+ * TIP SHEET PAYROLL AUTOMATION
+ * Durable + correct-date version
+ *
+ * Uses helper cells on Daily Tips:
+ *   Q1 = true start date
+ *   R1 = true end date
+ *
+ * Row 2 stays as real date formulas based on Q1.
+ ************************************************************/
+
+function runPayrollAndOpen() {
+  const result = runPayrollCore_();
+  showOpenNewPayrollDialog_(result.url, result.name);
+}
+
+function runPayroll() {
+  const result = runPayrollCore_();
+  showOpenNewPayrollDialog_(result.url, result.name);
+}
+
+function runPayrollCore_() {
+  const sourceSs = SpreadsheetApp.getActiveSpreadsheet();
+  const tz = sourceSs.getSpreadsheetTimeZone() || 'America/Los_Angeles';
+
+  const dailyTips = sourceSs.getSheetByName('Daily Tips');
+  const teamSummary = sourceSs.getSheetByName('Team Summary');
+
+  if (!dailyTips) throw new Error("Could not find 'Daily Tips'.");
+  if (!teamSummary) throw new Error("Could not find 'Team Summary'.");
+
+  // Ensure Q1/R1 exist and are CORRECT.
+  bootstrapOrRepairHelperDates_(dailyTips, tz);
+
+  const currentStartRaw = dailyTips.getRange('Q1').getValue();
+  const currentEndRaw = dailyTips.getRange('R1').getValue();
+
+  if (!(currentStartRaw instanceof Date) || isNaN(currentStartRaw.getTime())) {
+    throw new Error("Daily Tips!Q1 must contain a valid start date.");
+  }
+  if (!(currentEndRaw instanceof Date) || isNaN(currentEndRaw.getTime())) {
+    throw new Error("Daily Tips!R1 must contain a valid end date.");
+  }
+
+  const currentStart = normalizeDate_(currentStartRaw);
+  const currentEnd = normalizeDate_(currentEndRaw);
+
+  // Validate current helper range
+  const expectedCurrentEnd = addDays_(currentStart, 13);
+  if (expectedCurrentEnd.getTime() !== currentEnd.getTime()) {
+    throw new Error("Q1:R1 does not represent a valid 14-day pay period.");
+  }
+
+  // NEXT PAY PERIOD: day after current end
+  const nextStart = addDays_(currentEnd, 1);
+  const nextEnd = addDays_(nextStart, 13);
+  const nextDates = build14DayRange_(nextStart);
+
+  const oldName = sourceSs.getName();
+  const newName = buildNewSpreadsheetName_(oldName, nextStart, nextEnd, tz);
+
+  const sourceFile = DriveApp.getFileById(sourceSs.getId());
+  const copiedFile = sourceFile.makeCopy(newName);
+  const copiedSs = SpreadsheetApp.openById(copiedFile.getId());
+  copiedSs.rename(newName);
+
+  resetDailyTipsSheet_(copiedSs, nextStart, nextEnd);
+  resetDatedTabs_(copiedSs, nextDates, tz);
+  setupPayrollCell_(copiedSs);
+
+  SpreadsheetApp.flush();
+
+  sourceSs.toast("New payroll file created: " + newName, "Payroll Automation", 8);
+
+  return {
+    id: copiedSs.getId(),
+    url: copiedSs.getUrl(),
+    name: newName
+  };
+}
+
+/************************************************************
+ * BOOTSTRAP / REPAIR HELPER DATES
+ *
+ * Makes Q1/R1 match what B2/O2 VISIBLY show in the sheet.
+ * This fixes previously shifted helper dates too.
+ ************************************************************/
+function bootstrapOrRepairHelperDates_(dailyTipsSheet, tz) {
+  const q1 = dailyTipsSheet.getRange('Q1');
+  const r1 = dailyTipsSheet.getRange('R1');
+
+  // Visible values the user sees
+  const b2Text = String(dailyTipsSheet.getRange('B2').getDisplayValue()).trim(); // e.g. 2/16
+  const o2Text = String(dailyTipsSheet.getRange('O2').getDisplayValue()).trim(); // e.g. 3/1
+
+  // Underlying date cells only used to detect YEAR in spreadsheet timezone
+  const b2Raw = dailyTipsSheet.getRange('B2').getValue();
+  const o2Raw = dailyTipsSheet.getRange('O2').getValue();
+
+  if (!(b2Raw instanceof Date) || isNaN(b2Raw.getTime())) {
+    throw new Error("B2 must contain a valid date.");
+  }
+  if (!(o2Raw instanceof Date) || isNaN(o2Raw.getTime())) {
+    throw new Error("O2 must contain a valid date.");
+  }
+
+  const b2Year = Number(Utilities.formatDate(b2Raw, tz, 'yyyy'));
+  const o2Year = Number(Utilities.formatDate(o2Raw, tz, 'yyyy'));
+
+  const b2Parsed = parseMonthDayWithYearLocal_(b2Text, b2Year);
+  const o2Parsed = parseMonthDayWithYearLocal_(o2Text, o2Year);
+
+  if (!b2Parsed || !o2Parsed) {
+    throw new Error(`Could not parse B2 (${b2Text}) or O2 (${o2Text}).`);
+  }
+
+  const q1Val = q1.getValue();
+  const r1Val = r1.getValue();
+
+  const q1Valid = q1Val instanceof Date && !isNaN(q1Val.getTime());
+  const r1Valid = r1Val instanceof Date && !isNaN(r1Val.getTime());
+
+  const q1Norm = q1Valid ? normalizeDate_(q1Val) : null;
+  const r1Norm = r1Valid ? normalizeDate_(r1Val) : null;
+
+  const mustRepair =
+    !q1Valid ||
+    !r1Valid ||
+    q1Norm.getTime() !== b2Parsed.getTime() ||
+    r1Norm.getTime() !== o2Parsed.getTime();
+
+  if (mustRepair) {
+    q1.setValue(b2Parsed);
+    r1.setValue(o2Parsed);
+    q1.setNumberFormat('m/d/yyyy');
+    r1.setNumberFormat('m/d/yyyy');
+  }
+
+  // Keep helper columns hidden
+  dailyTipsSheet.hideColumns(17, 2);
+
+  // Ensure row 2 formulas are based on Q1
+  setDailyTipDateFormulas_(dailyTipsSheet);
+}
+
+/************************************************************
+ * DAILY TIPS RESET
+ ************************************************************/
+function resetDailyTipsSheet_(ss, nextStart, nextEnd) {
+  const sheet = ss.getSheetByName('Daily Tips');
+  if (!sheet) throw new Error("Copied spreadsheet is missing 'Daily Tips'.");
+
+  sheet.getRange('Q1').setValue(normalizeDate_(nextStart));
+  sheet.getRange('R1').setValue(normalizeDate_(nextEnd));
+  sheet.getRange('Q1:R1').setNumberFormat('m/d/yyyy');
+
+  sheet.hideColumns(17, 2);
+
+  setDailyTipDateFormulas_(sheet);
+
+  sheet.getRange('B3:O4').clearContent();
+  sheet.getRange('B7:O13').clearContent();
+}
+
+function setDailyTipDateFormulas_(sheet) {
+  const formulas = [[
+    '=$Q$1',
+    '=$Q$1+1',
+    '=$Q$1+2',
+    '=$Q$1+3',
+    '=$Q$1+4',
+    '=$Q$1+5',
+    '=$Q$1+6',
+    '=$Q$1+7',
+    '=$Q$1+8',
+    '=$Q$1+9',
+    '=$Q$1+10',
+    '=$Q$1+11',
+    '=$Q$1+12',
+    '=$Q$1+13'
+  ]];
+
+  sheet.getRange('B2:O2').setFormulas(formulas);
+  sheet.getRange('B2:O2').setNumberFormat('m/d');
+}
+
+/************************************************************
+ * DATED TABS RESET
+ ************************************************************/
+function resetDatedTabs_(ss, nextDates, tz) {
+  const sheets = ss.getSheets();
+
+  if (sheets.length < 16) {
+    throw new Error(`Expected at least 16 sheet tabs, but found ${sheets.length}.`);
+  }
+
+  const datedSheets = sheets.slice(2, 16);
+
+  for (let i = 0; i < datedSheets.length; i++) {
+    datedSheets[i].setName(`__TMP_PAYROLL_${i + 1}__`);
+  }
+
+  for (let i = 0; i < datedSheets.length; i++) {
+    const sheet = datedSheets[i];
+    sheet.setName(formatTabName_(nextDates[i], tz));
+
+    sheet.getRange('B2:C12').clearContent();
+    sheet.getRange('B15:C17').clearContent();
+
+    sheet.getRange('B2').setValue(1);
+    sheet.getRange('C2').setValue(1);
+    sheet.getRange('C15').setValue(1);
+
+    sheet.getRange('H17').clearContent();
+  }
+}
+
+/************************************************************
+ * UI
+ ************************************************************/
+function setupPayrollCell_(ss) {
+  const sheet = ss.getSheetByName('Daily Tips');
+  if (!sheet) return;
+
+  const cell = sheet.getRange('P22');
+  cell.setValue('RUN PAYROLL');
+  cell.setFontWeight('bold');
+  cell.setHorizontalAlignment('center');
+  cell.setVerticalAlignment('middle');
+  cell.setBackground('#d9ead3');
+  cell.setBorder(true, true, true, true, true, true);
+  cell.setNote("Assign your drawing/button to runPayrollAndOpen");
+}
+
+function showOpenNewPayrollDialog_(url, fileName) {
+  const safeUrl = escapeHtml_(url);
+  const safeName = escapeHtml_(fileName);
+
+  const html = HtmlService.createHtmlOutput(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <base target="_top">
+        <style>
+          body { font-family: Arial, sans-serif; padding: 16px; line-height: 1.4; }
+          .btn {
+            display: inline-block;
+            margin-top: 12px;
+            padding: 10px 14px;
+            background: #1a73e8;
+            color: white;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: 600;
+          }
+        </style>
+      </head>
+      <body>
+        <div><strong>New payroll sheet created:</strong></div>
+        <div>${safeName}</div>
+        <a class="btn" href="${safeUrl}" target="_blank" rel="noopener">Open new payroll sheet</a>
+        <script>
+          window.onload = function () {
+            try { window.open("${safeUrl}", "_blank", "noopener"); } catch (e) {}
+          };
+        </script>
+      </body>
+    </html>
+  `).setWidth(420).setHeight(180);
+
+  SpreadsheetApp.getUi().showModalDialog(html, 'Payroll Created');
+}
+
+function onOpen() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  SpreadsheetApp.getUi()
+    .createMenu('Payroll Tools')
+    .addItem('Run Payroll', 'runPayrollAndOpen')
+    .addItem('Format P17 Label', 'setupPayrollButton')
+    .addToUi();
+
+  setupPayrollCell_(ss);
+}
+
+function setupPayrollButton() {
+  setupPayrollCell_(SpreadsheetApp.getActiveSpreadsheet());
+}
+
+/************************************************************
+ * HELPERS
+ ************************************************************/
+function normalizeDate_(dateObj) {
+  return new Date(
+    dateObj.getFullYear(),
+    dateObj.getMonth(),
+    dateObj.getDate(),
+    12, 0, 0, 0
+  );
+}
+
+function addDays_(dateObj, days) {
+  const d = normalizeDate_(dateObj);
+  d.setDate(d.getDate() + days);
+  return normalizeDate_(d);
+}
+
+function build14DayRange_(startDate) {
+  const out = [];
+  for (let i = 0; i < 14; i++) {
+    out.push(addDays_(startDate, i));
+  }
+  return out;
+}
+
+function parseMonthDayWithYearLocal_(text, year) {
+  const m = text.match(/^(\d{1,2})\/(\d{1,2})$/);
+  if (!m) return null;
+
+  const month = Number(m[1]);
+  const day = Number(m[2]);
+
+  return new Date(year, month - 1, day, 12, 0, 0, 0);
+}
+
+function formatMD_(dateObj, tz) {
+  return Utilities.formatDate(normalizeDate_(dateObj), tz, 'M/d');
+}
+
+function formatTabName_(dateObj, tz) {
+  return Utilities.formatDate(normalizeDate_(dateObj), tz, 'EEE M/d');
+}
+
+function buildNewSpreadsheetName_(oldName, startDate, endDate, tz) {
+  const newRange = `${formatMD_(startDate, tz)} to ${formatMD_(endDate, tz)}`;
+  const rangeRegex = /\b\d{1,2}\/\d{1,2}\s*(?:to|-)\s*\d{1,2}\/\d{1,2}\b/i;
+
+  if (rangeRegex.test(oldName)) {
+    return oldName.replace(rangeRegex, newRange);
+  }
+
+  return `${oldName} ${newRange}`;
+}
+
+function escapeHtml_(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
